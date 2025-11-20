@@ -81,7 +81,7 @@ if "diagnosis" not in st.session_state:
 # 1. PANTALLA DE LOGIN
 # Si el usuario no está autenticado, muestra el formulario de login.
 if not st.session_state.is_authenticated:
-    st.image("https://i.imgur.com/3g2z9QJ.png", width=80) # Un logo simple
+    st.image("ipn.png", width=80) # Un logo simple
     st.title("Bienvenido a MediScan AI")
     st.write("Sistema de diagnóstico médico por imagen.")
     
