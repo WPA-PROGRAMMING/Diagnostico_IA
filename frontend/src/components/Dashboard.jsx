@@ -2,52 +2,79 @@ import { useState, useEffect } from "react"
 import axios from "axios"
 import { Button } from "./ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs"
-import { Activity, History, LogOut, Upload, Sun, Moon, Laptop } from "lucide-react"
+import { Activity, History, LogOut, Upload, Sun, Moon, AlertCircle } from "lucide-react"
 import { ScanSection } from "./ScanSection"
 import { HistorySection } from "./HistorySection"
-import { useTheme } from "./ThemeProvider" // <--- Importante para el modo oscuro
+import { useTheme } from "./ThemeProvider"
 
 export function Dashboard({ onLogout, token }) {
   const [history, setHistory] = useState([])
-  const { theme, setTheme } = useTheme()  // <--- Agregamos 'theme' aquí
-  // --- 1. CARGAR HISTORIAL AL INICIAR ---
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const { theme, setTheme } = useTheme()
+
+  // --- CARGAR HISTORIAL AL INICIAR ---
   useEffect(() => {
     const fetchHistory = async () => {
       if (!token) return
 
       try {
-        // Petición al Backend
+        setLoading(true)
+        setError(null)
+        
+        console.log("Cargando historial...")
         const response = await axios.get('http://127.0.0.1:8000/history', {
-          headers: { 'Authorization': `Bearer ${token}` }
+          headers: { 'Authorization': `Bearer ${token}` },
+          timeout: 10000 // 10 segundos timeout
         })
 
-        // Transformamos los datos (Backend Python -> Frontend React)
-        const mappedData = response.data.map((item) => ({
-          id: item.id,
-          patientName: item.patient_name || "Sin nombre", // Fallback
-          nss: item.nss || "N/A",
-          diagnosis: item.prediction,
-          // Convertimos "98.5%" a número flotante 98.5
-          confidence: parseFloat(item.confidence.replace('%', '')),
-          date: item.timestamp,
-          // Construimos la URL de la imagen
-          imageUrl: `http://127.0.0.1:8000/static/${item.filename}`
-        }))
+        if (response.data && response.data.length > 0) {
+          // Transformar datos con los nuevos campos
+          const mappedData = response.data.map((item) => ({
+            id: item.id,
+            patientName: item.patient_name || "Sin nombre",
+            nss: item.nss || "N/A",
+            diagnosis: item.prediction,
+            confidence: parseFloat(item.confidence?.replace('%', '') || 0),
+            date: item.timestamp,
+            imageUrl: `http://127.0.0.1:8000/static/${item.filename}`,
+            gradcamUrl: item.gradcam_filename ? `http://127.0.0.1:8000/gradcam/${item.gradcam_filename}` : null,
+            probabilities: item.probabilities_json ? JSON.parse(item.probabilities_json) : null
+          }))
 
-        // Guardamos invirtiendo el orden (el más nuevo primero)
-        setHistory(mappedData.reverse())
+          setHistory(mappedData.reverse())
+          console.log(`Historial cargado: ${mappedData.length} registros`)
+        } else {
+          // No hay historial - no es un error
+          setHistory([])
+          console.log("No hay historial disponible")
+        }
       } catch (error) {
         console.error("Error cargando historial:", error)
+        if (error.code === 'NETWORK_ERROR' || !error.response) {
+          setError("No se puede conectar con el servidor. Verifique que el backend esté ejecutándose.")
+        } else if (error.response.status === 401) {
+          setError("Sesión expirada. Por favor, inicie sesión nuevamente.")
+          onLogout() // Cerrar sesión si el token es inválido
+        } else if (error.response.status === 404) {
+          // No hay historial - no es un error
+          setHistory([])
+          setError(null)
+        } else {
+          setError("Error al cargar el historial. Intente nuevamente.")
+        }
+      } finally {
+        setLoading(false)
       }
     }
 
     fetchHistory()
-  }, [token])
+  }, [token, onLogout])
 
-  // --- 2. ACTUALIZAR AL ESCANEAR ---
+  // --- ACTUALIZAR AL ESCANEAR ---
   const handleNewScan = (record) => {
-    // Agregamos el nuevo registro al principio de la lista
     setHistory([record, ...history])
+    setError(null) // Limpiar error si había uno
   }
 
   return (
@@ -73,7 +100,6 @@ export function Dashboard({ onLogout, token }) {
                 onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
                 title="Cambiar tema"
               >
-                {/* Si theme es 'dark', muestra el Sol. Si no, la Luna */}
                 {theme === "dark" ? (
                   <Sun className="h-[1.2rem] w-[1.2rem]" />
                 ) : (
@@ -93,6 +119,19 @@ export function Dashboard({ onLogout, token }) {
 
       {/* CONTENIDO PRINCIPAL */}
       <main className="container mx-auto py-8 px-4">
+        {/* Mostrar error solo si es un error real, no cuando no hay historial */}
+        {error && (
+          <div className="mb-6 p-4 border border-red-200 bg-red-50 dark:bg-red-900/20 dark:border-red-800 rounded-lg flex items-center gap-3">
+            <AlertCircle className="h-5 w-5 text-red-500" />
+            <div>
+              <p className="text-red-700 dark:text-red-300 font-medium">{error}</p>
+              <p className="text-red-600 dark:text-red-400 text-sm mt-1">
+                Verifique que el servidor esté ejecutándose en http://127.0.0.1:8000
+              </p>
+            </div>
+          </div>
+        )}
+
         <Tabs defaultValue="scan" className="space-y-6">
 
           {/* Navegación de Pestañas */}
@@ -103,6 +142,11 @@ export function Dashboard({ onLogout, token }) {
               </TabsTrigger>
               <TabsTrigger value="history" className="gap-2">
                 <History className="h-4 w-4" /> Historial
+                {history.length > 0 && (
+                  <span className="ml-1 bg-primary text-primary-foreground rounded-full px-2 py-0.5 text-xs">
+                    {history.length}
+                  </span>
+                )}
               </TabsTrigger>
             </TabsList>
           </div>
@@ -114,7 +158,16 @@ export function Dashboard({ onLogout, token }) {
 
           {/* Pestaña 2: Historial */}
           <TabsContent value="history" className="animate-in fade-in-50 duration-500">
-            <HistorySection history={history} />
+            {loading ? (
+              <div className="flex justify-center items-center p-12">
+                <div className="text-center">
+                  <Activity className="h-8 w-8 mx-auto mb-4 animate-spin text-primary" />
+                  <p>Cargando historial...</p>
+                </div>
+              </div>
+            ) : (
+              <HistorySection history={history} />
+            )}
           </TabsContent>
 
         </Tabs>

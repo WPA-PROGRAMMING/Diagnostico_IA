@@ -1,15 +1,17 @@
 import os
 import shutil
 import uuid
+import json
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import List
 
-from . import models, schemas, database
+from . import models, schemas, database, ml_model
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
@@ -18,8 +20,10 @@ SECRET_KEY = "tu_clave_super_secreta"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 UPLOAD_DIR = "uploaded_images"
+GRADCAM_DIR = "gradcam_images"  # Nueva carpeta para GradCAMs
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(GRADCAM_DIR, exist_ok=True)  # Crear carpeta GradCAM
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -28,11 +32,11 @@ models.Base.metadata.create_all(bind=database.engine)
 
 app = FastAPI(title="Medical Assistant AI API")
 
-# --- CORS (Actualizado para Next.js) ---
+# --- CORS ---
 origins = [
-    "http://localhost:5173",    # Puerto de Vite (El que estás usando ahora)
-    "http://127.0.0.1:5173",    # La versión numérica
-    "http://localhost:3000",    # (Opcional) Déjalo si piensas usar Next.js después
+    "http://localhost:5173",
+    "http://127.0.0.1:5173", 
+    "http://localhost:3000",
 ]
 
 app.add_middleware(
@@ -43,13 +47,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Montar directorios estáticos
 app.mount("/static", StaticFiles(directory=UPLOAD_DIR), name="static")
+app.mount("/gradcam", StaticFiles(directory=GRADCAM_DIR), name="gradcam")  # Nuevo endpoint para GradCAMs
 
-# ... (Las funciones verify_password, get_password_hash, create_access_token, get_current_user NO CAMBIAN) ...
-# Copia esas funciones del código anterior o déjalas como están si ya las tienes.
-# Solo pondré los cambios en los ENDPOINTS abajo:
-
-# --- FUNCIONES AUXILIARES REPETIDAS (Para que el código esté completo si copias y pegas) ---
+# --- FUNCIONES AUXILIARES ---
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -107,44 +109,85 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     access_token = create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- ENDPOINT PREDICT ACTUALIZADO ---
+# --- ENDPOINT PREDICT MEJORADO ---
 @app.post("/predict", response_model=schemas.DiagnosisOut)
 async def predict_condition(
     file: UploadFile = File(...),
-    # Recibimos los nuevos campos como Form Data
     patientName: str = Form(...), 
     nss: str = Form(...),
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(database.get_db)
 ):
-    # 1. Guardar archivo
-    file_extension = file.filename.split(".")[-1]
-    unique_filename = f"{uuid.uuid4()}.{file_extension}"
-    file_location = f"{UPLOAD_DIR}/{unique_filename}"
+    # Validar tipo de archivo
+    allowed_extensions = {'png', 'jpg', 'jpeg', 'bmp', 'tiff'}
+    file_extension = file.filename.split('.')[-1].lower()
+    if file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400, 
+            detail="Formato de archivo no soportado. Use: PNG, JPG, JPEG, BMP, TIFF"
+        )
     
-    with open(file_location, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    # 2. Simulación IA
-    is_pneumonia = "neu" in file.filename.lower()
-    prediction_text = "Neumonía Detectada" if is_pneumonia else "Condición Normal"
-    confidence_score = "94.5%" if is_pneumonia else "98.2%"
-    
-    # 3. Guardar en BD con los nuevos campos
-    new_diagnosis = models.DiagnosisHistory(
-        filename=unique_filename,
-        prediction=prediction_text,
-        confidence=confidence_score,
-        patient_name=patientName, # Guardamos nombre
-        nss=nss,                  # Guardamos NSS
-        user_id=current_user.id 
-    )
-    
-    db.add(new_diagnosis)
-    db.commit()
-    db.refresh(new_diagnosis)
-    
-    return new_diagnosis
+    try:
+        # 1. Guardar archivo
+        unique_filename = f"{uuid.uuid4()}.{file_extension}"
+        file_location = f"{UPLOAD_DIR}/{unique_filename}"
+        
+        with open(file_location, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        print(f"Imagen guardada en: {file_location}")
+        
+        # 2. Realizar predicción con el modelo real
+        prediction_result = ml_model.ai_model.predict_image(file_location)
+        print(f"Predicción completada: {prediction_result}")
+        
+        # 3. Generar GradCAM - INTENTAR CON EL FEATURE EXTRACTOR
+        gradcam_filename = None
+        try:
+            gradcam_filename = ml_model.ai_model.generate_gradcam(
+                file_location, 
+                prediction_result['predicted_class_index']
+            )
+            if gradcam_filename:
+                print(f"GradCAM generado: {gradcam_filename}")
+            else:
+                print("GradCAM no se pudo generar (pero continuamos)")
+        except Exception as gradcam_error:
+            print(f"Error en GradCAM (no crítico): {gradcam_error}")
+            gradcam_filename = None
+        
+        # 4. Guardar en BD
+        new_diagnosis = models.DiagnosisHistory(
+            filename=unique_filename,
+            gradcam_filename=gradcam_filename,
+            prediction=prediction_result['predicted_class'],
+            confidence=f"{prediction_result['confidence']:.2%}",
+            patient_name=patientName,
+            nss=nss,
+            user_id=current_user.id,
+            probabilities_json=json.dumps(prediction_result['all_predictions'])
+        )
+        
+        db.add(new_diagnosis)
+        db.commit()
+        db.refresh(new_diagnosis)
+        
+        print(f"Diagnóstico guardado en BD con ID: {new_diagnosis.id}")
+        print(f"Datos guardados: Predicción={new_diagnosis.prediction}, GradCAM={new_diagnosis.gradcam_filename}")
+        
+        return new_diagnosis
+        
+    except Exception as e:
+        # Limpiar archivo en caso de error
+        if 'file_location' in locals() and os.path.exists(file_location):
+            os.remove(file_location)
+        print(f"Error en endpoint /predict: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error procesando la imagen: {str(e)}"
+        )
 
 @app.get("/history", response_model=List[schemas.DiagnosisOut])
 def get_history(
@@ -152,3 +195,30 @@ def get_history(
     db: Session = Depends(database.get_db)
 ):
     return current_user.diagnoses
+
+# Endpoint de salud del modelo
+@app.get("/model-health")
+def model_health():
+    try:
+        # Verificar que los modelos estén cargados
+        models_loaded = (
+            ml_model.ai_model.svm_model is not None and 
+            ml_model.ai_model.feature_extractor is not None and 
+            ml_model.ai_model.class_info is not None
+        )
+        
+        return {
+            "status": "healthy" if models_loaded else "unhealthy",
+            "message": "Modelos cargados correctamente" if models_loaded else "Modelos no cargados correctamente",
+            "classes": ml_model.ai_model.class_info['class_names'] if models_loaded else [],
+            "gradcam_available": True  # Ahora siempre disponible con el feature extractor
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.get("/")
+def read_root():
+    return {"message": "Medical Assistant AI API - Con GradCAM integrado"}

@@ -1,2 +1,5 @@
+/backend/uploaded_images
+/backend/gradcam_images
+/backend/medical_ai.db
 node_modules
 /backend/venv/
